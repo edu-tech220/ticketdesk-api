@@ -1,0 +1,37 @@
+services:
+  sqlserver:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_SA_PASSWORD: "Your_strong_Passw0rd"
+    ports:
+      - "1433:1433"
+    volumes:
+      - ticketdesk-sqlserver-data:/var/opt/mssql
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/mssql-tools18/bin/sqlcmd -C -S localhost -U sa -P \"$$MSSQL_SA_PASSWORD\" -Q 'SELECT 1' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8080"
+    environment:
+      ASPNETCORE_ENVIRONMENT: "Development"
+      ConnectionStrings__DefaultConnection: "Server=sqlserver,1433;Database=TicketDesk;User Id=sa;Password=Your_strong_Passw0rd;TrustServerCertificate=True;"
+      Jwt__Issuer: "TicketDesk.Api"
+      Jwt__Audience: "TicketDesk.Clients"
+      Jwt__SigningKey: "docker-compose-dev-signing-key-change-me-0123456789"
+      Jwt__ExpirationMinutes: "60"
+      AdminSeed__Email: "admin@ticketdesk.local"
+      AdminSeed__Password: "ChangeMe123!"
+    depends_on:
+      sqlserver:
+        condition: service_healthy
+
+volumes:
+  ticketdesk-sqlserver-data:
