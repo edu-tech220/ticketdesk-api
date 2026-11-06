@@ -1,138 +1,214 @@
 # TicketDesk API
 
-API REST para la venta de boletos de eventos con cupo limitado: niveles de boletos (tiers),
-reservas temporales ("holds") que expiran solas, confirmación de compra y control de
-sobreventa bajo concurrencia real.
+> Event ticketing backend with limited capacity: self-expiring holds, purchase confirmation and oversell protection under real concurrency.
 
-## Qué resuelve
+[![CI](https://github.com/edu-tech220/ticketdesk-api/actions/workflows/ci.yml/badge.svg)](https://github.com/edu-tech220/ticketdesk-api/actions/workflows/ci.yml)
+![.NET 8](https://img.shields.io/badge/.NET-8.0-512BD4?style=flat-square&logo=dotnet&logoColor=white)
+![ASP.NET Core](https://img.shields.io/badge/ASP.NET%20Core-Web%20API-512BD4?style=flat-square&logo=dotnet&logoColor=white)
+![EF Core](https://img.shields.io/badge/EF%20Core-8.0-6DB33F?style=flat-square)
+![SQL Server](https://img.shields.io/badge/SQL%20Server-2022-CC2927?style=flat-square&logo=microsoftsqlserver&logoColor=white)
+![Docker](https://img.shields.io/badge/Docker-Compose-2496ED?style=flat-square&logo=docker&logoColor=white)
 
-Vender boletos con cupo limitado tiene un problema clásico de concurrencia: si dos compradores
-intentan reservar el último boleto al mismo tiempo, un sistema ingenuo puede vender el mismo
-boleto dos veces. TicketDesk resuelve esto con un flujo de **reserva en dos pasos**:
+## 📌 Overview
 
-1. **Hold (reserva temporal):** el comprador aparta `N` boletos de un nivel por un tiempo limitado
-   (10 minutos por defecto). El cupo se descuenta de inmediato para que nadie más lo use.
-2. **Confirm (confirmación):** el comprador confirma el hold antes de que expire. Si no lo hace,
-   un `BackgroundService` libera el cupo automáticamente para que vuelva a estar disponible.
+TicketDesk is a REST API for selling event tickets with limited capacity: ticket tiers, temporary
+reservations ("holds") that expire on their own, purchase confirmation and oversell control under
+real concurrency.
 
-Reglas de negocio que no son un CRUD trivial:
+Selling limited tickets has a classic concurrency problem: if two buyers try to reserve the last
+ticket at the same moment, a naive system can sell it twice. TicketDesk solves this with a
+**two-step reservation flow**:
 
-- **Control de sobreventa bajo concurrencia:** dos solicitudes simultáneas sobre el mismo nivel
-  de boletos compiten por la misma fila; una gana y la otra se reintenta con datos frescos o
-  recibe un 409 si ya no hay cupo. Nunca se vende más de lo disponible.
-- **Máquina de estados de la reserva:** `Held → Confirmed | Expired | Cancelled`. Cada transición
-  valida quién puede hacerla y en qué condiciones (dueño, admin, tiempo restante).
-- **Expiración automática de holds:** un `BackgroundService` recorre las reservas vencidas cada
-  30 segundos y libera su cupo sin intervención manual.
-- **Límites anti-acaparamiento:** máximo de boletos por solicitud y máximo de boletos activos por
-  usuario y nivel, además de un *rate limit* sobre el endpoint de reserva para frenar bots.
-- **Ciclo de vida del evento:** un evento nace en `Draft`, solo puede publicarse si tiene al menos
-  un nivel de boletos, y al cancelarse libera y cancela en cascada todas sus reservas activas.
-- **Paginación y filtrado** en el listado público de eventos.
+1. **Hold** — the buyer sets aside `N` tickets of a tier for a limited time (10 minutes by
+   default). Availability is decremented immediately so nobody else can take them.
+2. **Confirm** — the buyer confirms the hold before it expires. If they don't, a
+   `BackgroundService` releases the tickets automatically so they become available again.
 
-## Arquitectura
+## ✨ Key features and business rules
 
+- **Oversell protection under concurrency** — two simultaneous requests on the same tier compete
+  for the same row; one wins and the other retries with fresh data, or gets a `409` if there is no
+  capacity left. Availability never goes below zero.
+- **Reservation state machine** — `Held → Confirmed | Expired | Cancelled`. Each transition checks
+  who may perform it and under which conditions (owner, admin, time remaining):
+  - only the owner can confirm, and only while the hold is `Held` and not expired;
+  - the owner can cancel a `Held` reservation; a `Confirmed` one can only be cancelled by an admin.
+- **Automatic hold expiry** — a `BackgroundService` scans expired holds every 30 seconds and
+  returns their tickets to the pool without manual intervention.
+- **Anti-hoarding limits** — a maximum number of tickets per request (6) and a maximum of active
+  tickets per user and tier (6), plus a rate limit on the hold endpoint to slow down bots.
+- **Event lifecycle** — an event starts as `Draft`, can only be published if it has at least one
+  ticket tier, and when cancelled it cascades: all its active reservations are cancelled and their
+  tickets released. Holds are rejected for unpublished or already-started events.
+- **Pagination and filtering** on the public event listing (filter by status, page size capped at 50).
+
+## 🏗️ Architecture
+
+Layering is **Controller → Service → DbContext**. Controllers contain no business logic; the
+concurrency, validation and state-transition rules live in the services, which are the most
+heavily tested part of the codebase.
+
+```mermaid
+flowchart LR
+    Client -->|HTTP + JWT| MW[ExceptionHandlingMiddleware<br/>RateLimiter · Auth]
+    MW --> C[Controllers<br/>Auth · Events · Reservations]
+    C --> S[Services<br/>AuthService · EventService · ReservationService]
+    S --> DB[(AppDbContext<br/>EF Core)]
+    BG[HoldExpirationBackgroundService<br/>every 30 s] --> S
+    DB --> SQL[(SQL Server)]
 ```
-src/TicketDesk.Api/
-├── Controllers/          Auth, Events, Reservations (finos, delegan a Services)
-├── Services/             Reglas de negocio (AuthService, EventService, ReservationService)
-├── Domain/
-│   ├── Entities/         User, Event, TicketTier, Reservation
-│   └── Enums/            UserRole, EventStatus, ReservationStatus
-├── Data/                 AppDbContext + migraciones EF Core
-├── Dtos/                 Contratos de entrada/salida por recurso
-├── Security/             JWT, hashing PBKDF2, usuario actual desde el token
-├── BackgroundServices/    HoldExpirationBackgroundService
-└── Common/               Excepciones de dominio, middleware -> ProblemDetails, políticas de rate limit
+
+```mermaid
+stateDiagram-v2
+    [*] --> Held: POST /api/reservations
+    Held --> Confirmed: confirm (owner, before expiry)
+    Held --> Expired: hold time elapsed
+    Held --> Cancelled: cancel (owner) / event cancelled
+    Confirmed --> Cancelled: cancel (admin) / event cancelled
 ```
 
-Capas: **Controller → Service → DbContext**. Los controladores no contienen lógica de negocio;
-las reglas de concurrencia, validación y transición de estados viven en los `Service`, que son la
-pieza que se prueba con más detalle.
+## 🧠 Technical decisions
 
-### Decisiones técnicas
+- **Application-managed concurrency token instead of a database one.** Rather than SQL Server's
+  `rowversion` (which SQLite does not support), `TicketTier` and `Reservation` have a `Version`
+  column configured with `IsConcurrencyToken()` that `AppDbContext` increments on every
+  `SaveChanges`. The result is the same optimistic control (EF throws
+  `DbUpdateConcurrencyException` if someone else modified the row first), and it behaves the same
+  on SQL Server (production) and SQLite (tests) without per-provider logic.
+- **Bounded retries instead of pessimistic locks.** `ReservationService.CreateHoldAsync` retries up
+  to `MaxConcurrencyRetries` times, re-reading the tier when it collides with a concurrent write,
+  instead of locking the row. It is simpler to reason about and avoids deadlocks for a domain of
+  this size.
+- **In-process polling for expiry, not SQL Agent or an external cron.** A `BackgroundService` in
+  the API process releases expired holds every 30 seconds. At this scope it is simpler than
+  coordinating an external job and needs no extra infrastructure.
+- **Custom PBKDF2 instead of ASP.NET Core Identity.** Identity brings far more than this domain
+  needs (2FA, UI, etc.). A PBKDF2 hasher (100,000 iterations) plus hand-rolled JWT covers the use
+  case with fewer moving parts.
+- **Uniform `ProblemDetails` via middleware.** Domain exceptions (`NotFoundException` → 404,
+  `ConflictException` → 409, `ValidationException` → 422, `ForbiddenException` → 403,
+  `UnauthorizedException` → 401) and `DbUpdateConcurrencyException` (→ 409) are mapped to HTTP
+  status codes and a consistent `application/problem+json` body in `ExceptionHandlingMiddleware`,
+  so no controller repeats `try/catch`.
+- **Per-user rate limiting.** The hold endpoint uses a fixed-window policy of 10 requests per
+  10 seconds, partitioned by authenticated user (falling back to the client IP).
+- **Options pattern for business limits.** Hold duration, per-request and per-user limits and the
+  retry count are configured in the `Reservations` section of `appsettings.json`.
 
-- **Token de concurrencia manejado por la aplicación, no por el motor de datos.** En vez de usar
-  `rowversion` de SQL Server (que SQLite no soporta), `TicketTier` y `Reservation` tienen una
-  columna `Version` marcada como `IsConcurrencyToken()` que `AppDbContext` incrementa en cada
-  `SaveChanges`. El resultado es el mismo control optimista (EF lanza
-  `DbUpdateConcurrencyException` si alguien más modificó la fila primero), pero funciona igual en
-  SQL Server (producción) y SQLite (pruebas), sin duplicar lógica por proveedor.
-- **Reintentos acotados en vez de locks pesimistas.** `ReservationService.CreateHoldAsync` reintenta
-  hasta `MaxConcurrencyRetries` veces releyendo el nivel de boletos cuando choca con otra escritura
-  concurrente, en lugar de bloquear la fila. Es más simple de razonar y evita interbloqueos para el
-  tamaño de este dominio.
-- **Expiración por polling, no por SQL Agent/cron externo.** Un `BackgroundService` dentro del
-  mismo proceso de la API libera los holds vencidos cada 30 segundos. Para este alcance es más
-  simple que coordinar un job externo y no depende de infraestructura adicional.
-- **PBKDF2 propio en vez de ASP.NET Core Identity.** Identity trae mucho más de lo que este
-  dominio necesita (roles, 2FA, UI). Un hasher PBKDF2 + JWT manual cubre el caso de uso con menos
-  piezas que entender.
-- **`ProblemDetails` uniforme vía middleware.** Las excepciones de dominio
-  (`NotFoundException`, `ConflictException`, `ValidationException`, `ForbiddenException`,
-  `UnauthorizedException`) se mapean a códigos HTTP y a un cuerpo `application/problem+json`
-  consistente en `ExceptionHandlingMiddleware`, para no repetir `try/catch` en cada controlador.
+## 🧰 Tech stack
 
-## Cómo correrlo
+| Area | Technology |
+|---|---|
+| Language / runtime | C# · .NET 8 |
+| Web | ASP.NET Core Web API (controllers), Swagger / OpenAPI (Swashbuckle) |
+| Data access | Entity Framework Core 8 (code-first migrations) |
+| Database | SQL Server 2022 (SQLite in tests) |
+| Background work | `BackgroundService` (hosted service) |
+| Security | JWT Bearer, PBKDF2, ASP.NET Core rate limiting |
+| Testing | xUnit, `WebApplicationFactory` |
+| DevOps | Docker, Docker Compose, GitHub Actions |
 
-### Con Docker Compose (API + SQL Server)
+## 🚀 Getting started
+
+### With Docker Compose (API + SQL Server)
 
 ```bash
 docker compose up --build
 ```
 
-La API queda disponible en `http://localhost:8080`, con Swagger en `/swagger` (ambiente
-`Development`). Al arrancar aplica las migraciones pendientes y crea un usuario administrador de
-arranque (`AdminSeed:Email` / `AdminSeed:Password`, configurables por variables de entorno; valores
-de ejemplo únicamente, cámbialos antes de usarlos en un entorno real).
+The API is available at `http://localhost:8080`, with Swagger UI at
+`http://localhost:8080/swagger` (the compose file runs the `Development` environment). On startup
+it applies pending migrations and creates a bootstrap admin user from `AdminSeed:Email` /
+`AdminSeed:Password` (defaults: `admin@ticketdesk.local` / `ChangeMe123!`, overridable through
+environment variables).
 
-### Local, sin Docker
+> These credentials and the JWT signing key are sample values only — change them before using
+> the API in any real environment.
 
-Requiere .NET 8 SDK y una instancia de SQL Server accesible (ajusta
-`ConnectionStrings:DefaultConnection` en `appsettings.Development.json` o por variable de entorno).
+### Locally (without Docker)
+
+Requires the .NET 8 SDK and a reachable SQL Server instance (set
+`ConnectionStrings:DefaultConnection` in `appsettings.Development.json` or through an environment
+variable).
 
 ```bash
 dotnet restore
 dotnet run --project src/TicketDesk.Api
 ```
 
-## Cómo probarlo
+With the default `http` launch profile the API runs on `http://localhost:5081` (Swagger at
+`/swagger`).
 
-Las pruebas no requieren SQL Server ni Docker: usan SQLite (archivo temporal) y
-`WebApplicationFactory` para levantar la API completa en memoria.
+### Configuration
+
+| Key | Default | Purpose |
+|---|---|---|
+| `Reservations:HoldDurationMinutes` | `10` | How long a hold reserves tickets |
+| `Reservations:MaxQuantityPerHold` | `6` | Max tickets per hold request |
+| `Reservations:MaxActiveTicketsPerUserPerTier` | `6` | Max held + confirmed tickets per user and tier |
+| `Reservations:MaxConcurrencyRetries` | `3` | Retries on optimistic-concurrency conflicts |
+| `Jwt:*` | — | Issuer, audience, signing key, expiration |
+| `AdminSeed:*` | — | Bootstrap admin credentials |
+
+## 🧪 Running tests
 
 ```bash
 dotnet test
 ```
 
-Incluye:
+The suite has **31 tests** and needs neither SQL Server nor Docker: it uses SQLite (a temporary
+file) and `WebApplicationFactory` to run the full API in memory.
 
-- **Pruebas unitarias** de `ReservationService` (holds, confirmación, cancelación, expiración) y
-  `EventService` (ciclo de vida del evento), incluyendo una prueba que lanza **20 solicitudes
-  concurrentes** contra un nivel con cupo de 5 y verifica que nunca se reservan más de 5 boletos.
-- **Pruebas unitarias** de `AuthService`, el hasher PBKDF2 y la generación de JWT.
-- **Pruebas de integración** end-to-end sobre la API real (`WebApplicationFactory`): flujo
-  completo de crear evento → publicar → reservar → confirmar → cancelar evento, además de casos
-  de autorización (401/403) y una prueba que confirma que el *rate limit* del endpoint de reservas
-  responde `429`.
+| Area | File | What it covers |
+|---|---|---|
+| Reservations | `Unit/ReservationServiceTests.cs` | Holds, confirmation, cancellation, expiry, limits — including **20 concurrent buyers against a tier with 5 tickets**, asserting exactly 5 succeed and nothing is oversold |
+| Events | `Unit/EventServiceTests.cs` | Event lifecycle (draft, publish, cancel cascade) |
+| Auth | `Unit/AuthServiceTests.cs` | Registration and login |
+| Security | `Unit/Pbkdf2PasswordHasherTests.cs`, `Unit/JwtTokenServiceTests.cs` | Password hashing and JWT generation |
+| End-to-end | `Integration/TicketDeskEndToEndTests.cs` | Create event → add tier → publish → hold → confirm → cancel event; 401/403 authorization; `429` from the hold rate limit |
 
-## Flujo típico de la API
+CI (`.github/workflows/ci.yml`) restores, builds and tests the solution on every push and pull
+request to `main`, then builds the Docker image.
 
-1. `POST /api/auth/register` — alta de cliente.
-2. `POST /api/auth/login` — devuelve un JWT (el usuario administrador de arranque también inicia
-   sesión aquí).
-3. `POST /api/events` *(Admin)* — crea un evento en estado `Draft`.
-4. `POST /api/events/{id}/tiers` *(Admin)* — agrega niveles de boletos (nombre, precio, cupo).
-5. `POST /api/events/{id}/publish` *(Admin)* — publica el evento (requiere al menos un nivel).
-6. `GET /api/events` — listado público paginado, filtrable por estado.
-7. `POST /api/reservations` *(autenticado)* — aparta boletos de un nivel (hold, sujeto a rate limit).
-8. `POST /api/reservations/{id}/confirm` *(dueño)* — confirma la compra antes de que expire.
-9. `POST /api/reservations/{id}/cancel` *(dueño del hold, o Admin si ya está confirmada)*.
-10. `GET /api/reservations/mine` — reservas del usuario autenticado, paginadas.
-11. `POST /api/events/{id}/cancel` *(Admin)* — cancela el evento y libera todo el cupo reservado.
+## 📡 API endpoints
 
-## Stack
+| Method | Route | Access | Description |
+|---|---|---|---|
+| POST | `/api/auth/register` | Public | Register a customer |
+| POST | `/api/auth/login` | Public | Get a JWT (the bootstrap admin logs in here too) |
+| GET | `/api/events` | Public | Paginated event list, filterable by status |
+| GET | `/api/events/{eventId}` | Public | Event details with tiers |
+| POST | `/api/events` | Admin | Create an event in `Draft` |
+| POST | `/api/events/{eventId}/tiers` | Admin | Add a ticket tier (name, price, quota) |
+| POST | `/api/events/{eventId}/publish` | Admin | Publish (requires at least one tier) |
+| POST | `/api/events/{eventId}/cancel` | Admin | Cancel the event and release all reserved tickets |
+| POST | `/api/reservations` | Authenticated | Create a hold (rate-limited) |
+| POST | `/api/reservations/{reservationId}/confirm` | Owner | Confirm the purchase before the hold expires |
+| POST | `/api/reservations/{reservationId}/cancel` | Owner (hold) / Admin (confirmed) | Cancel a reservation |
+| GET | `/api/reservations/mine` | Authenticated | The current user's reservations, paginated |
 
-C# / .NET 8 · ASP.NET Core Web API · Entity Framework Core · SQL Server (SQLite en pruebas) ·
-JWT Bearer · PBKDF2 · Rate limiting · xUnit · WebApplicationFactory · Docker · Docker Compose ·
-GitHub Actions · Swagger / OpenAPI.
+## 📁 Project structure
+
+```
+.
+├── .github/workflows/ci.yml       # Build, test and Docker image build
+├── Dockerfile                     # Multi-stage build, runs as non-root user on port 8080
+├── docker-compose.yml             # API + SQL Server 2022
+├── TicketDesk.slnx
+├── src/TicketDesk.Api/
+│   ├── BackgroundServices/        # HoldExpirationBackgroundService
+│   ├── Common/                    # Domain exceptions, ProblemDetails middleware, rate-limit policies
+│   ├── Controllers/               # Auth, Events, Reservations (thin, delegate to services)
+│   ├── Data/                      # AppDbContext + EF Core migrations
+│   ├── Domain/
+│   │   ├── Entities/              # User, Event, TicketTier, Reservation
+│   │   └── Enums/                 # UserRole, EventStatus, ReservationStatus
+│   ├── Dtos/                      # Request/response contracts per resource
+│   ├── Security/                  # JWT, PBKDF2 hashing, current user from the token
+│   ├── Services/                  # Business rules (AuthService, EventService, ReservationService)
+│   └── Program.cs
+└── tests/TicketDesk.Tests/
+    ├── Integration/               # End-to-end tests with WebApplicationFactory
+    ├── TestUtils/                 # SQLite test database, test data builder
+    └── Unit/                      # Service, hasher and token tests
+```
